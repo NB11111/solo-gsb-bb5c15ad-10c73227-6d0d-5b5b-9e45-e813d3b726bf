@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引 / 字幕空隙提示编排")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引 / 字幕空隙提示编排 / 角色抢话分析")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -2576,4 +2576,236 @@ def hint_export(req: HintRequest):
         content=content.encode("utf-8"),
         media_type="application/x-subrip",
         headers={"Content-Disposition": 'attachment; filename="hinted.srt"'},
+    )
+
+
+# ---------------------------------------------------------------- 角色抢话分析
+
+class TalkoverRequest(BaseModel):
+    srt: str  # 每条字幕正文首行须以「[角色名]」开头
+
+
+ROLE_TAG_RE = re.compile(r"^\[([^\[\]]*)\]")
+
+
+def _entry_role(e: dict):
+    """取字幕正文首行的「[角色名]」标记。
+
+    返回 (角色名, None)；缺失标记或角色名去首尾空白后为空时返回
+    (None, 原因)。标记必须位于正文首行的最开头，前面不得有空白。
+    """
+    if not e["lines"]:
+        return None, "正文为空，缺少「[角色名]」标记"
+    m = ROLE_TAG_RE.match(e["lines"][0])
+    if not m:
+        return None, "正文首行缺少「[角色名]」标记"
+    name = m.group(1).strip()
+    if not name:
+        return None, "「[角色名]」中的角色名为空"
+    return name, None
+
+
+def _union_intervals(intervals: List[tuple]) -> List[tuple]:
+    """左闭右开区间求并集。
+
+    按起点排序后单趟合并：后段起点 <= 前段终点（含端点相触）即并入前段；
+    空时长 / 起止倒置区间不占时间轴，直接丢弃。
+    """
+    valid = sorted((s, e) for s, e in intervals if e > s)
+    if not valid:
+        return []
+    merged = [list(valid[0])]
+    for s, e in valid[1:]:
+        if s <= merged[-1][1]:  # 左闭右开：端点相触也合并为同一并集
+            if e > merged[-1][1]:
+                merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return [tuple(x) for x in merged]
+
+
+def analyze_talkover(entries: List[dict]) -> dict:
+    """角色抢话分析主逻辑。
+
+    1. 每条字幕正文首行须以「[角色名]」开头，角色名去首尾空白后同名合并；
+       缺失标记或空角色名时指出原字幕序号并拒绝分析（ValueError）；
+    2. 先对同一角色的字幕时间按左闭右开区间 [start, end) 求并集；
+    3. 再以各角色并集的全部边界切分时间轴，逐段记录活跃角色集合
+       （端点相触不算同时活跃：同一时刻先离场后入场）；
+    4. 仅有两名及以上角色同时活跃的片段计入抢话；相邻且活跃角色集合
+       相同的抢话片段合并；
+    5. 汇总每名角色独占毫秒数（仅自己活跃）与每对角色共同发言毫秒数
+       （两人同时活跃即计入，允许有第三人在场）。
+
+    返回 {names, overlaps, solo, pairs}：overlaps 为 [{start,end,names}]，
+    names 为按首次出现顺序排列的角色列表；solo 为 {角色: ms}；pairs 为
+    [((角色A, 角色B), ms)]（按角色首次出现顺序排列，含 0 毫秒对）。
+    """
+    problems = []
+    raw = {}   # 角色名 -> [(start_ms, end_ms)]
+    order = []  # 角色首次出现顺序（兼作展示与排序次序）
+    for i, e in enumerate(entries, 1):
+        name, err = _entry_role(e)
+        if err is not None:
+            problems.append(f"第 {i} 条字幕（原序号 {e['index']}）{err}")
+            continue
+        if name not in raw:
+            raw[name] = []
+            order.append(name)
+        raw[name].append((e["start"], e["end"]))
+    if problems:
+        raise ValueError(
+            "；".join(problems) + "，已拒绝分析，请为这些字幕补全角色标记后重试"
+        )
+
+    # 同一角色的字幕区间先求并集
+    unions = {name: _union_intervals(raw[name]) for name in order}
+
+    # 以各角色并集边界切分时间轴：起点 +1 活跃、终点 -1 离场，
+    # 同一时刻的事件先成组结算区间再统一改集合（左闭右开，端点相触不算）
+    events = []
+    for name in order:
+        for s, e in unions[name]:
+            events.append((s, 1, name))
+            events.append((e, -1, name))
+    events.sort(key=lambda ev: (ev[0], ev[1]))
+
+    segments = []  # (start_ms, end_ms, frozenset(角色))
+    active = set()
+    cur_t = None
+    k = 0
+    while k < len(events):
+        t = events[k][0]
+        if cur_t is not None and active and t > cur_t:
+            segments.append((cur_t, t, frozenset(active)))
+        while k < len(events) and events[k][0] == t:
+            _, delta, name = events[k]
+            if delta == 1:
+                active.add(name)
+            else:
+                active.discard(name)
+            k += 1
+        cur_t = t
+
+    # 抢话片段：活跃角色 >= 2；相邻且活跃集合相同的片段合并
+    overlaps = []
+    for s, e, names in segments:
+        if len(names) < 2:
+            continue
+        if overlaps and overlaps[-1]["end"] == s and overlaps[-1]["names"] == names:
+            overlaps[-1]["end"] = e
+        else:
+            overlaps.append({"start": s, "end": e, "names": names})
+
+    # 汇总：角色独占 / 角色对共同发言（按首次出现顺序定序）
+    rank = {name: i for i, name in enumerate(order)}
+    solo = {name: 0 for name in order}
+    pair_ms = {
+        (order[i], order[j]): 0
+        for i in range(len(order)) for j in range(i + 1, len(order))
+    }
+    for s, e, names in segments:
+        dur = e - s
+        if len(names) == 1:
+            solo[next(iter(names))] += dur
+        else:
+            ns = sorted(names, key=lambda n: rank[n])
+            for x in range(len(ns)):
+                for y in range(x + 1, len(ns)):
+                    pair_ms[(ns[x], ns[y])] += dur
+    pairs = sorted(pair_ms.items(), key=lambda kv: (rank[kv[0][0]], rank[kv[0][1]]))
+    return {"names": order, "overlaps": overlaps, "solo": solo, "pairs": pairs}
+
+
+def _talkover_prepare(req: "TalkoverRequest"):
+    """角色抢话分析公共预处理：解析 SRT 并做角色标记 / 抢话分析，失败抛 400。"""
+    try:
+        entries = parse_srt(req.srt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        result = analyze_talkover(entries)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entries, result
+
+
+def _talkover_overlap_payload(seq: int, o: dict, rank: dict) -> dict:
+    return {
+        "seq": seq,
+        "start": fmt_time(o["start"]),
+        "end": fmt_time(o["end"]),
+        "start_ms": o["start"],
+        "end_ms": o["end"],
+        "duration_ms": o["end"] - o["start"],
+        "roles": sorted(o["names"], key=rank.get),
+    }
+
+
+@app.post("/api/talkover/preview")
+def talkover_preview(req: TalkoverRequest):
+    entries, r = _talkover_prepare(req)
+    names = r["names"]
+    rank = {n: i for i, n in enumerate(names)}
+    overlaps = [
+        _talkover_overlap_payload(k, o, rank)
+        for k, o in enumerate(r["overlaps"], 1)
+    ]
+    return {
+        "entry_count": len(entries),
+        "role_count": len(names),
+        "roles": names,
+        "overlap_count": len(overlaps),
+        "overlap_total_ms": sum(o["end"] - o["start"] for o in r["overlaps"]),
+        "overlaps": overlaps,
+        "solo": [
+            {"role": n, "ms": r["solo"][n], "time": fmt_time(r["solo"][n])}
+            for n in names
+        ],
+        "pairs": [
+            {"role_a": a, "role_b": b, "ms": ms, "time": fmt_time(ms)}
+            for (a, b), ms in r["pairs"]
+        ],
+    }
+
+
+_TALKOVER_SEG_HEADER = ["序号", "起点(ms)", "终点(ms)", "时长(ms)",
+                        "起点", "终点", "同时发言角色"]
+_TALKOVER_SOLO_HEADER = ["角色", "独占(ms)", "独占时长"]
+_TALKOVER_PAIR_HEADER = ["角色A", "角色B", "共同发言(ms)", "共同发言时长"]
+
+
+@app.post("/api/talkover/export")
+def talkover_export(req: TalkoverRequest):
+    _entries, r = _talkover_prepare(req)
+    rank = {n: i for i, n in enumerate(r["names"])}
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")  # RFC 4180：CRLF、按需加引号
+    writer.writerow(["# 抢话片段（两名及以上角色同时活跃，端点相触不算）"])
+    writer.writerow(_TALKOVER_SEG_HEADER)
+    for k, o in enumerate(r["overlaps"], 1):
+        writer.writerow([
+            k,
+            o["start"],
+            o["end"],
+            o["end"] - o["start"],
+            fmt_time(o["start"]),
+            fmt_time(o["end"]),
+            "、".join(sorted(o["names"], key=rank.get)),
+        ])
+    writer.writerow([])
+    writer.writerow(["# 每名角色独占时长（仅该角色一人活跃）"])
+    writer.writerow(_TALKOVER_SOLO_HEADER)
+    for n in r["names"]:
+        writer.writerow([n, r["solo"][n], fmt_time(r["solo"][n])])
+    writer.writerow([])
+    writer.writerow(["# 每对角色共同发言时长（两人同时活跃即计入，允许有第三人在场）"])
+    writer.writerow(_TALKOVER_PAIR_HEADER)
+    for (a, b), ms in r["pairs"]:
+        writer.writerow([a, b, ms, fmt_time(ms)])
+    # UTF-8 BOM，确保 Excel 直接双击打开时中文不乱码
+    return Response(
+        content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="talkover.csv"'},
     )

@@ -96,6 +96,11 @@
           padding: 1px 6px; font-size: 12px; }
   tr.pos-conflict td { background: #fef2f2; }
   .occ-side-label { font-size: 12px; color: #6b7280; }
+  /* ---- 角色抢话分析 ---- */
+  .tk-role { display: inline-block; background: #ede9fe; color: #6d28d9; border-radius: 4px;
+          padding: 1px 8px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .tk-summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 760px) { .tk-summary-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -393,6 +398,31 @@
   </div>
   <div id="hintMessage"></div>
   <div id="hintResult"></div>
+</div>
+
+<hr class="feature-divider">
+<h1 id="talkover">角色抢话分析</h1>
+<p class="hint">粘贴一份带<strong>角色标记</strong>的 SRT：每条字幕正文<strong>首行须以 <code>[角色名]</code> 开头</strong>
+（如 <code>[Alice] 你好</code>），角色名去首尾空白后<strong>同名合并</strong>；缺失标记或角色名为空时会指出原字幕序号并拒绝分析。
+先把同一角色的字幕时间按<strong>左闭右开区间求并集</strong>，再按各角色并集边界切分时间轴：
+只有<strong>两名及以上角色同时活跃</strong>的片段计入抢话（端点相触不算），相邻且活跃角色集合相同的片段自动合并。
+预览列出每个抢话片段及其角色，并汇总每名角色的<strong>独占毫秒数</strong>与每对角色的<strong>共同发言毫秒数</strong>；可下载包含片段与汇总的 UTF-8 CSV。</p>
+
+<div class="card">
+  <h2>20. 带角色标记的 SRT</h2>
+  <input type="file" id="tkFile" accept=".srt,.txt">
+  <textarea id="tkSrt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;[Alice] 你好，最近怎么样？&#10;&#10;2&#10;00:00:02,500 --> 00:00:04,000&#10;[Bob] 还不错，你呢？"></textarea>
+</div>
+
+<div class="card">
+  <h2>21. 预览抢话与下载 CSV</h2>
+  <div class="toolbar">
+    <button onclick="tkPreview()">预览抢话分析</button>
+    <button id="tkExportBtn" onclick="tkExport()" disabled>下载抢话分析 CSV</button>
+    <span class="hint" id="tkExportHint">请先预览，角色标记校验通过后才能下载</span>
+  </div>
+  <div id="tkMessage"></div>
+  <div id="tkResult"></div>
 </div>
 
 <script>
@@ -1458,6 +1488,117 @@ async function hintExport() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "hinted.srt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 角色抢话分析
+
+bindTrackFile("tkFile", "tkSrt");
+
+function tkPayload() {
+  return JSON.stringify({ srt: $("tkSrt").value });
+}
+
+function showTkError(msg) {
+  $("tkMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("tkResult").innerHTML = "";
+  $("tkExportBtn").disabled = true;
+}
+
+function tkErrDetail(data) {
+  if (!data || data.detail == null) return "请求失败";
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return data.detail.map(d => d.msg || JSON.stringify(d)).join("；");
+  return data.detail.message || JSON.stringify(data.detail);
+}
+
+function renderTkPreview(pv) {
+  const segRows = pv.overlaps.map(o => `
+    <tr>
+      <td>${o.seq}</td>
+      <td class="mono">${escapeHtml(o.start)} --&gt; ${escapeHtml(o.end)}</td>
+      <td>${o.start_ms} – ${o.end_ms}</td>
+      <td>${o.duration_ms}</td>
+      <td>${o.roles.map(r => `<span class="tk-role">${escapeHtml(r)}</span>`).join(" ")}</td>
+    </tr>`).join("");
+  const segTable = pv.overlap_count ? `<table>
+      <tr><th style="width:3em">#</th><th>抢话时间</th><th>毫秒</th><th>时长(ms)</th><th>同时发言角色</th></tr>
+      ${segRows}
+    </table>` : `<div class="hint">没有任何两名及以上角色同时活跃的片段。</div>`;
+
+  const soloRows = pv.solo.map(s => `
+    <tr>
+      <td><span class="tk-role">${escapeHtml(s.role)}</span></td>
+      <td>${s.ms}</td>
+      <td class="mono">${escapeHtml(s.time)}</td>
+    </tr>`).join("");
+
+  const pairRows = pv.pairs.length ? pv.pairs.map(p => `
+    <tr>
+      <td><span class="tk-role">${escapeHtml(p.role_a)}</span>
+          <span class="hint">×</span>
+          <span class="tk-role">${escapeHtml(p.role_b)}</span></td>
+      <td>${p.ms}</td>
+      <td class="mono">${escapeHtml(p.time)}</td>
+    </tr>`).join("")
+    : `<tr><td colspan="3" class="hint">不足两名角色，没有角色对。</td></tr>`;
+
+  $("tkResult").innerHTML =
+    `<h3 style="font-size:14px;margin:8px 0">抢话片段（${pv.overlap_count} 段，合计 ${pv.overlap_total_ms} ms）</h3>` +
+    segTable +
+    `<div class="tk-summary-grid">
+       <div>
+         <h3 style="font-size:14px;margin:12px 0 6px">每名角色独占时长</h3>
+         <table>
+           <tr><th>角色</th><th style="width:8em">独占(ms)</th><th>独占时长</th></tr>
+           ${soloRows}
+         </table>
+       </div>
+       <div>
+         <h3 style="font-size:14px;margin:12px 0 6px">每对角色共同发言时长</h3>
+         <table>
+           <tr><th>角色对</th><th style="width:8em">共同发言(ms)</th><th>共同发言时长</th></tr>
+           ${pairRows}
+         </table>
+       </div>
+     </div>`;
+
+  $("tkMessage").innerHTML =
+    `<div class="ok-banner">✓ 字幕 ${pv.entry_count} 条 / 角色 ${pv.role_count} 名` +
+    (pv.role_count ? `（${pv.roles.map(escapeHtml).join("、")}）` : "") +
+    `；抢话片段 <strong>${pv.overlap_count}</strong> 段，合计 ${pv.overlap_total_ms} ms，可以下载。</div>`;
+  $("tkExportBtn").disabled = false;
+}
+
+async function tkPreview() {
+  $("tkMessage").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/talkover/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: tkPayload(),
+    });
+  } catch (e) { return showTkError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderTkPreview(data);
+  return showTkError(tkErrDetail(data));
+}
+
+async function tkExport() {
+  let res;
+  try {
+    res = await fetch("/api/talkover/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: tkPayload(),
+    });
+  } catch (e) { return showTkError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showTkError(tkErrDetail(data) || "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "talkover.csv";
   a.click();
   URL.revokeObjectURL(a.href);
 }
