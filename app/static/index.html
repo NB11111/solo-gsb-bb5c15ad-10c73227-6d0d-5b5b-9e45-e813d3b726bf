@@ -96,6 +96,11 @@
           padding: 1px 6px; font-size: 12px; }
   tr.pos-conflict td { background: #fef2f2; }
   .occ-side-label { font-size: 12px; color: #6b7280; }
+  /* ---- 角色抢话分析 ---- */
+  .role-tag { display: inline-block; background: #ede9fe; color: #6d28d9;
+          border: 1px solid #ddd6fe; border-radius: 4px;
+          padding: 1px 8px; font-size: 12px; margin: 1px 4px 1px 0; white-space: nowrap; }
+  tr.role-overlap-row td { background: #f5f3ff; }
 </style>
 </head>
 <body>
@@ -393,6 +398,33 @@
   </div>
   <div id="hintMessage"></div>
   <div id="hintResult"></div>
+</div>
+
+<hr class="feature-divider">
+<h1 id="roleoverlap">角色抢话分析</h1>
+<p class="hint">粘贴一份按角色标记的 SRT：<strong>每条字幕正文首行必须以「[角色名]」开头</strong>
+（如 <code>[张三] 你好</code>），角色名去首尾空白后<strong>同名合并</strong>；
+缺少「[角色名]」标记或角色名为空时，会指出<strong>原字幕序号</strong>并拒绝分析。
+先把<strong>同一角色</strong>的字幕时间按<strong>左闭右开</strong>区间求并集，再以各角色并集边界切分时间轴：
+<strong>仅有两名及以上角色同时活跃的片段计入抢话</strong>（端点相触不算），相邻且活跃角色集合相同的片段自动合并。
+预览列出全部抢话片段及角色，并汇总每名角色的<strong>独占毫秒数</strong>与每对角色的<strong>共同发言毫秒数</strong>；
+确认后可下载含抢话片段与两项汇总的 UTF-8 CSV。</p>
+
+<div class="card">
+  <h2>20. 角色字幕内容</h2>
+  <input type="file" id="roFile" accept=".srt,.txt">
+  <textarea id="roSrt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;[张三] 你好&#10;&#10;2&#10;00:00:02,000 --> 00:00:04,000&#10;[李四] 怎么了"></textarea>
+</div>
+
+<div class="card">
+  <h2>21. 预览抢话分析与下载 CSV</h2>
+  <div class="toolbar">
+    <button onclick="rolePreview()">预览抢话分析</button>
+    <button id="roExportBtn" onclick="roleExport()" disabled>下载抢话分析 CSV</button>
+    <span class="hint" id="roExportHint">请先预览，校验通过后才能下载</span>
+  </div>
+  <div id="roMessage"></div>
+  <div id="roResult"></div>
 </div>
 
 <script>
@@ -1458,6 +1490,115 @@ async function hintExport() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "hinted.srt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 角色抢话分析
+
+bindTrackFile("roFile", "roSrt");
+
+function rolePayload() {
+  return JSON.stringify({ srt: $("roSrt").value });
+}
+
+function showRoleError(msg) {
+  $("roMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("roResult").innerHTML = "";
+  $("roExportBtn").disabled = true;
+}
+
+function roleErrDetail(data) {
+  if (!data || data.detail == null) return "请求失败";
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return data.detail.map(d => d.msg || JSON.stringify(d)).join("；");
+  return data.detail.message || JSON.stringify(data.detail);
+}
+
+function roleTagsHtml(names) {
+  return names.map(n => `<span class="role-tag">${escapeHtml(n)}</span>`).join("");
+}
+
+function renderRolePreview(pv) {
+  const segRows = pv.segments.map(s => `
+    <tr class="role-overlap-row">
+      <td>${s.seq}</td>
+      <td class="mono">${escapeHtml(s.start)} --&gt; ${escapeHtml(s.end)}</td>
+      <td>${s.start_ms} – ${s.end_ms}</td>
+      <td>${s.duration_ms}</td>
+      <td>${s.roles.length} 人<br>${roleTagsHtml(s.roles)}</td>
+      <td class="mono">${escapeHtml(s.indices.join("、"))}</td>
+    </tr>`).join("");
+  const segTable = pv.overlap_count ? `<table>
+      <tr><th style="width:3em">#</th><th>抢话时间</th><th>毫秒</th><th style="width:7em">时长(ms)</th>
+      <th style="width:16em">抢话角色</th><th style="width:10em">相关原字幕序号</th></tr>
+      ${segRows}
+    </table>` : `<div class="hint">没有两名及以上角色同时活跃的片段。</div>`;
+
+  const soloRows = pv.solo.map(r => `
+    <tr><td><span class="role-tag">${escapeHtml(r.role)}</span></td>
+    <td>${r.solo_ms}</td><td class="mono">${escapeHtml(r.solo)}</td></tr>`).join("");
+  const soloTable = `<table>
+      <tr><th>角色</th><th style="width:10em">独占毫秒</th><th style="width:14em">独占时长</th></tr>
+      ${soloRows}
+    </table>`;
+
+  const pairRows = pv.pairs.map(p => `
+    <tr><td><span class="role-tag">${escapeHtml(p.role_a)}</span></td>
+    <td><span class="role-tag">${escapeHtml(p.role_b)}</span></td>
+    <td>${p.overlap_ms}</td><td class="mono">${escapeHtml(p.overlap)}</td></tr>`).join("");
+  const pairTable = pv.pairs.length ? `<table>
+      <tr><th>角色 A</th><th>角色 B</th><th style="width:12em">共同发言毫秒</th>
+      <th style="width:14em">共同发言时长</th></tr>
+      ${pairRows}
+    </table>` : `<div class="hint">没有任何一对角色共同发言。</div>`;
+
+  $("roResult").innerHTML =
+    `<h3 style="font-size:14px;margin:8px 0">抢话片段（${pv.overlap_count} 段，合计 ${pv.total_overlap_ms} ms）</h3>` +
+    segTable +
+    `<h3 style="font-size:14px;margin:12px 0 6px">每名角色独占时长（${pv.role_count} 名角色）</h3>` +
+    soloTable +
+    `<h3 style="font-size:14px;margin:12px 0 6px">每对角色共同发言时长（${pv.pairs.length} 对）</h3>` +
+    pairTable;
+
+  const banner = pv.overlap_count
+    ? `<div class="ok-banner">✓ 共解析 ${pv.entry_count} 条字幕、${pv.role_count} 名角色；` +
+      `发现 <strong>${pv.overlap_count}</strong> 段抢话，合计 <strong>${pv.total_overlap_ms}</strong> ms` +
+      `（${escapeHtml(pv.total_overlap)}），可以下载 CSV。</div>`
+    : `<div class="bad-banner">✓ 共解析 ${pv.entry_count} 条字幕、${pv.role_count} 名角色；` +
+      `没有抢话片段（CSV 仅含独占 / 共同发言汇总，时长均为 0），仍可下载。</div>`;
+  $("roMessage").innerHTML = banner;
+  $("roExportBtn").disabled = false;
+}
+
+async function rolePreview() {
+  $("roMessage").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/roleoverlap/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: rolePayload(),
+    });
+  } catch (e) { return showRoleError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderRolePreview(data);
+  return showRoleError(roleErrDetail(data));
+}
+
+async function roleExport() {
+  let res;
+  try {
+    res = await fetch("/api/roleoverlap/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: rolePayload(),
+    });
+  } catch (e) { return showRoleError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showRoleError(roleErrDetail(data) || "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "role_overlap.csv";
   a.click();
   URL.revokeObjectURL(a.href);
 }

@@ -7,6 +7,7 @@
 import csv
 import difflib
 import io
+import itertools
 import math
 import re
 import unicodedata
@@ -17,7 +18,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引 / 字幕空隙提示编排")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引 / 字幕空隙提示编排 / 角色抢话分析")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -2576,4 +2577,231 @@ def hint_export(req: HintRequest):
         content=content.encode("utf-8"),
         media_type="application/x-subrip",
         headers={"Content-Disposition": 'attachment; filename="hinted.srt"'},
+    )
+
+
+# ---------------------------------------------------------------- 角色抢话分析
+
+ROLE_TAG_RE = re.compile(r"^\s*\[([^\[\]]*)\]")
+
+
+class RoleOverlapRequest(BaseModel):
+    srt: str
+
+
+def _role_of_entry(entry: dict) -> str:
+    """取字幕正文首行的「[角色名]」标记，返回去首尾空白后的角色名。
+
+    首行须以 [角色名] 开头；缺少标记或方括号内去空白后为空均拒绝，
+    并指出该字幕在原 SRT 中的序号。标记之后的首行剩余文本与后续行
+    均为台词，不参与角色识别。
+    """
+    if not entry["lines"]:
+        raise ValueError(f"原字幕序号 {entry['index']}：正文为空，缺少「[角色名]」标记")
+    m = ROLE_TAG_RE.match(entry["lines"][0])
+    if not m:
+        raise ValueError(
+            f"原字幕序号 {entry['index']}：正文首行须以「[角色名]」开头，"
+            f"实际为 {entry['lines'][0][:40]!r}"
+        )
+    role = m.group(1).strip()
+    if not role:
+        raise ValueError(f"原字幕序号 {entry['index']}：角色名为空（形如「[]」）")
+    return role
+
+
+def _union_intervals(intervals: List[tuple]) -> List[tuple]:
+    """左闭右开区间求并集。
+
+    按起点排序后单趟合并：后段起点 ≤ 前段终点即并入同一段（端点相触
+    也会并入，但相触并并不改变覆盖的毫秒集合）。空时长 / 起止倒置
+    （end ≤ start）的区间不贡献任何覆盖，直接跳过。
+    """
+    valid = sorted((s, e) for s, e in intervals if e > s)
+    merged = []
+    for s, e in valid:
+        if merged and s <= merged[-1][1]:
+            if e > merged[-1][1]:
+                merged[-1] = (merged[-1][0], e)
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def analyze_role_overlap(entries: List[dict]):
+    """角色抢话分析。
+
+    步骤：
+      1) 每条字幕按首行「[角色名]」归类，角色名去首尾空白后同名合并；
+      2) 同一角色的全部字幕区间先按左闭右开求并集，得到各角色活跃区间；
+      3) 收集全部并集边界，按相邻边界切分时间轴；每段内活跃角色集合恒定，
+         区间按左闭右开归属（t ∈ [start, end)，端点相触不算同时活跃）；
+      4) 相邻且活跃角色集合相同的片段合并（无角色活跃的片段跳过）；
+      5) 仅保留活跃角色 ≥ 2 的片段为抢话片段。
+
+    统计（毫秒）：
+      - 每名角色的独占时长 = 仅该角色活跃的片段时长之和；
+      - 每对角色的共同发言时长 = 该两人同时活跃（允许还有其他人）的
+        片段时长之和。
+
+    返回 (roles, segments)：roles 为排序后的角色名列表；segments 为合并
+    后的非空片段 [{start, end, roles}]（含独占片段，抢话为 len>=2 者）。
+    """
+    role_ivs = {}  # 角色名 -> [(start, end)]（首次出现即完成同名合并）
+    for entry in entries:
+        role = _role_of_entry(entry)
+        role_ivs.setdefault(role, []).append((entry["start"], entry["end"]))
+    roles = sorted(role_ivs)
+    unions = {role: _union_intervals(role_ivs[role]) for role in roles}
+
+    # 以各角色并集的全部端点作为时间轴切分边界
+    bounds = sorted({b for ivs in unions.values() for s, e in ivs
+                     for b in (s, e)})
+    slices = []
+    for k in range(len(bounds) - 1):
+        lo, hi = bounds[k], bounds[k + 1]
+        if hi <= lo:
+            continue
+        mid = lo  # 段内活跃集合恒定，取左端点判定（左闭右开）
+        active = frozenset(
+            role for role in roles
+            if any(s <= mid < e for s, e in unions[role])
+        )
+        slices.append((lo, hi, active))
+
+    # 合并相邻且活跃角色集合相同的片段；无角色活跃的片段不参与（也不应并入）
+    segments = []
+    for lo, hi, active in slices:
+        if not active:
+            continue
+        if segments and active == segments[-1]["roles"] and lo == segments[-1]["end"]:
+            segments[-1]["end"] = hi
+        else:
+            segments.append({"start": lo, "end": hi, "roles": active})
+
+    def covered_indices(lo: int, hi: int) -> List[str]:
+        """与 [lo, hi) 有正时长交叠的原字幕序号（按条目顺序去重）。"""
+        out = []
+        for entry in entries:
+            if max(entry["start"], lo) < min(entry["end"], hi):
+                if not out or out[-1] != entry["index"]:
+                    out.append(entry["index"])
+        return out
+
+    for seg in segments:
+        seg["indices"] = covered_indices(seg["start"], seg["end"])
+    return roles, segments
+
+
+def _role_prepare(req: RoleOverlapRequest):
+    """角色抢话分析公共预处理：解析 SRT 并完成抢话分析，失败抛 400。"""
+    try:
+        entries = parse_srt(req.srt)
+        roles, segments = analyze_role_overlap(entries)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entries, roles, segments
+
+
+def _role_segment_payload(seg: dict, seq: int) -> dict:
+    return {
+        "seq": seq,
+        "start": fmt_time(seg["start"]),
+        "end": fmt_time(seg["end"]),
+        "start_ms": seg["start"],
+        "end_ms": seg["end"],
+        "duration_ms": seg["end"] - seg["start"],
+        "roles": sorted(seg["roles"]),
+        "indices": seg["indices"],
+    }
+
+
+def _role_summaries(roles: List[str], segments: List[dict]):
+    """汇总每名角色独占毫秒数与每对角色共同发言毫秒数。"""
+    solo = {role: 0 for role in roles}
+    pair_ms = {}
+    overlap_ms = 0
+    for seg in segments:
+        span = seg["end"] - seg["start"]
+        active = seg["roles"]
+        if len(active) == 1:
+            solo[next(iter(active))] += span
+        elif len(active) >= 2:
+            overlap_ms += span
+            for a, b in itertools.combinations(sorted(active), 2):
+                pair_ms[(a, b)] = pair_ms.get((a, b), 0) + span
+    solo_rows = [
+        {"role": role, "solo_ms": solo[role], "solo": fmt_time(solo[role])}
+        for role in roles
+    ]
+    pair_rows = [
+        {"role_a": a, "role_b": b, "overlap_ms": ms, "overlap": fmt_time(ms)}
+        for (a, b), ms in sorted(pair_ms.items(),
+                                 key=lambda kv: (-kv[1], kv[0][0], kv[0][1]))
+    ]
+    return solo_rows, pair_rows, overlap_ms
+
+
+@app.post("/api/roleoverlap/preview")
+def roleoverlap_preview(req: RoleOverlapRequest):
+    entries, roles, segments = _role_prepare(req)
+    overlaps = [s for s in segments if len(s["roles"]) >= 2]
+    solo_rows, pair_rows, overlap_ms_total = _role_summaries(roles, segments)
+    return {
+        "entry_count": len(entries),
+        "role_count": len(roles),
+        "roles": roles,
+        "overlap_count": len(overlaps),
+        "total_overlap_ms": overlap_ms_total,
+        "total_overlap": fmt_time(overlap_ms_total),
+        "segments": [_role_segment_payload(s, k)
+                     for k, s in enumerate(overlaps, 1)],
+        "solo": solo_rows,
+        "pairs": pair_rows,
+    }
+
+
+_ROLE_SEG_CSV_HEADER = ["序号", "起点(ms)", "终点(ms)", "时长(ms)",
+                        "起点", "终点", "抢话角色", "人数", "相关原字幕序号"]
+_ROLE_SOLO_CSV_HEADER = ["角色", "独占毫秒", "独占时长"]
+_ROLE_PAIR_CSV_HEADER = ["角色A", "角色B", "共同发言毫秒", "共同发言时长"]
+
+
+@app.post("/api/roleoverlap/export")
+def roleoverlap_export(req: RoleOverlapRequest):
+    _entries, roles, segments = _role_prepare(req)
+    overlaps = [s for s in segments if len(s["roles"]) >= 2]
+    solo_rows, pair_rows, _overlap_total = _role_summaries(roles, segments)
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")  # RFC 4180：CRLF、按需加引号
+    writer.writerow(["# 抢话片段"])
+    writer.writerow(_ROLE_SEG_CSV_HEADER)
+    for k, seg in enumerate(overlaps, 1):
+        seg_roles = sorted(seg["roles"])
+        writer.writerow([
+            k,
+            seg["start"],
+            seg["end"],
+            seg["end"] - seg["start"],
+            fmt_time(seg["start"]),
+            fmt_time(seg["end"]),
+            "、".join(seg_roles),
+            len(seg_roles),
+            "、".join(seg["indices"]),
+        ])
+    writer.writerow([])
+    writer.writerow(["# 每名角色独占时长"])
+    writer.writerow(_ROLE_SOLO_CSV_HEADER)
+    for r in solo_rows:
+        writer.writerow([r["role"], r["solo_ms"], r["solo"]])
+    writer.writerow([])
+    writer.writerow(["# 每对角色共同发言时长"])
+    writer.writerow(_ROLE_PAIR_CSV_HEADER)
+    for p in pair_rows:
+        writer.writerow([p["role_a"], p["role_b"], p["overlap_ms"], p["overlap"]])
+    # UTF-8 BOM，确保 Excel 直接双击打开时中文不乱码
+    return Response(
+        content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="role_overlap.csv"'},
     )
